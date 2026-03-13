@@ -11,7 +11,6 @@
 //! ```
 
 #![no_std]
-#![forbid(unsafe_code)]
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -174,10 +173,14 @@ impl Md5 {
         }
 
         // Process full 64-byte blocks directly from input.
-        while data.len() >= 64 {
-            let block: &[u8; 64] = data[..64].try_into().unwrap();
-            compress(&mut self.state, block);
-            data = &data[64..];
+        let n_blocks = data.len() / 64;
+        if n_blocks > 0 {
+            // SAFETY: data.len() >= n_blocks * 64, and [u8; 64] has the same
+            // layout as 64 contiguous u8s with no padding or alignment requirement.
+            let blocks: &[[u8; 64]] =
+                unsafe { core::slice::from_raw_parts(data.as_ptr().cast(), n_blocks) };
+            compress_blocks(&mut self.state, blocks);
+            data = &data[n_blocks * 64..];
         }
 
         // Buffer remaining bytes.
@@ -261,10 +264,15 @@ fn op_f(w: u32, x: u32, y: u32, z: u32, m: u32, c: u32, s: u32) -> u32 {
 #[allow(clippy::inline_always, clippy::many_single_char_names)]
 #[inline(always)]
 fn op_g(w: u32, x: u32, y: u32, z: u32, m: u32, c: u32, s: u32) -> u32 {
-    ((x & z) | (y & !z))
+    // Dependency shortcut: since (x & z) and (y & !z) have non-overlapping bits,
+    // OR can be replaced with ADD. This lets us delay the dependency on x (= b)
+    // by one operation — x only needs AND before joining the addition chain.
+    // See: https://github.com/animetosho/md5-optimisation
+    (y & !z)
         .wrapping_add(w)
         .wrapping_add(m)
         .wrapping_add(c)
+        .wrapping_add(x & z)
         .rotate_left(s)
         .wrapping_add(x)
 }
@@ -289,6 +297,14 @@ fn op_i(w: u32, x: u32, y: u32, z: u32, m: u32, c: u32, s: u32) -> u32 {
         .wrapping_add(c)
         .rotate_left(s)
         .wrapping_add(x)
+}
+
+/// Compress multiple 64-byte blocks into the state.
+#[inline]
+fn compress_blocks(state: &mut [u32; 4], blocks: &[[u8; 64]]) {
+    for block in blocks {
+        compress(state, block);
+    }
 }
 
 /// Compress a single 64-byte block into the state.
