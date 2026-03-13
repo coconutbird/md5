@@ -253,10 +253,14 @@ impl std::io::Write for Md5 {
 #[allow(clippy::inline_always, clippy::many_single_char_names)]
 #[inline(always)]
 fn op_f(w: u32, x: u32, y: u32, z: u32, m: u32, c: u32, s: u32) -> u32 {
-    ((x & y) | (!x & z))
+    // Dependency shortcut: F(b,c,d) = (b & c) | (~b & d). Since the two AND
+    // terms have non-overlapping bits, OR can be replaced with ADD. This lets
+    // (~b & d) feed into the accumulator without waiting for the OR gate.
+    (!x & z)
         .wrapping_add(w)
         .wrapping_add(m)
         .wrapping_add(c)
+        .wrapping_add(x & y)
         .rotate_left(s)
         .wrapping_add(x)
 }
