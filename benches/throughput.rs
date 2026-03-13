@@ -28,5 +28,19 @@ fn bench_rustcrypto(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_ours, bench_rustcrypto);
+fn bench_compute4(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compute4 (NEON)");
+    for &size in SIZES {
+        let data = vec![0xABu8; size];
+        // Throughput = 4× the input size since we hash 4 copies.
+        group.throughput(Throughput::Bytes(4 * size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), &data, |b, data| {
+            let inputs: [&[u8]; 4] = [data, data, data, data];
+            b.iter(|| md5::compute4(std::hint::black_box(inputs)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_ours, bench_rustcrypto, bench_compute4);
 criterion_main!(benches);

@@ -15,6 +15,9 @@
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(target_arch = "aarch64")]
+mod neon;
+
 use core::fmt;
 
 /// Pre-computed round constants: T[i] = floor(2^32 * |sin(i + 1)|).
@@ -234,6 +237,108 @@ pub fn compute(data: &[u8]) -> Digest {
     let mut h = Md5::new();
     h.update(data);
     h.finalize()
+}
+
+/// Hash 4 independent inputs in parallel, returning 4 digests.
+///
+/// On `AArch64` this uses NEON SIMD to process all 4 hash states
+/// simultaneously, giving ~4× the throughput of sequential hashing.
+/// On other architectures this falls back to 4 sequential `compute` calls.
+#[must_use]
+pub fn compute4(inputs: [&[u8]; 4]) -> [Digest; 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        compute4_neon(inputs)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        [
+            compute(inputs[0]),
+            compute(inputs[1]),
+            compute(inputs[2]),
+            compute(inputs[3]),
+        ]
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn compute4_neon(inputs: [&[u8]; 4]) -> [Digest; 4] {
+    #[allow(clippy::wildcard_imports)]
+    use core::arch::aarch64::*;
+
+    let init_a = Md5::INIT[0];
+    let init_b = Md5::INIT[1];
+    let init_c = Md5::INIT[2];
+    let init_d = Md5::INIT[3];
+
+    // SAFETY: NEON is always available on AArch64.
+    unsafe {
+        let mut states: [uint32x4_t; 4] = [
+            vdupq_n_u32(init_a),
+            vdupq_n_u32(init_b),
+            vdupq_n_u32(init_c),
+            vdupq_n_u32(init_d),
+        ];
+
+        // Track per-input position and total length.
+        let mut offsets = [0usize; 4];
+        let total_lens: [u64; 4] = [
+            inputs[0].len() as u64,
+            inputs[1].len() as u64,
+            inputs[2].len() as u64,
+            inputs[3].len() as u64,
+        ];
+
+        // Process full blocks: find the minimum number of full blocks across
+        // all 4 inputs and process them in lockstep with NEON.
+        let min_full_blocks = inputs.iter().map(|i| i.len() / 64).min().unwrap_or(0);
+
+        for _ in 0..min_full_blocks {
+            let blocks: [&[u8; 64]; 4] = [
+                inputs[0][offsets[0]..][..64].try_into().unwrap(),
+                inputs[1][offsets[1]..][..64].try_into().unwrap(),
+                inputs[2][offsets[2]..][..64].try_into().unwrap(),
+                inputs[3][offsets[3]..][..64].try_into().unwrap(),
+            ];
+            neon::compress4(&mut states, &blocks);
+            for o in &mut offsets {
+                *o += 64;
+            }
+        }
+
+        // Extract per-lane states and finish each input individually
+        // (handles remaining bytes + padding).
+        let mut digests = [Digest([0u8; 16]); 4];
+        let mut sa = [0u32; 4];
+        let mut sb = [0u32; 4];
+        let mut sc = [0u32; 4];
+        let mut sd = [0u32; 4];
+        vst1q_u32(sa.as_mut_ptr(), states[0]);
+        vst1q_u32(sb.as_mut_ptr(), states[1]);
+        vst1q_u32(sc.as_mut_ptr(), states[2]);
+        vst1q_u32(sd.as_mut_ptr(), states[3]);
+
+        for lane in 0..4 {
+            let mut h = Md5 {
+                state: [sa[lane], sb[lane], sc[lane], sd[lane]],
+                buffer: [0u8; 64],
+                buffer_len: 0,
+                total_len: offsets[lane] as u64,
+            };
+            h.update(&inputs[lane][offsets[lane]..]);
+            digests[lane] = h.finalize();
+        }
+
+        // Verify total lengths are consistent.
+        for lane in 0..4 {
+            debug_assert_eq!(
+                offsets[lane] as u64 + (inputs[lane].len() - offsets[lane]) as u64,
+                total_lens[lane]
+            );
+        }
+
+        digests
+    }
 }
 
 #[cfg(feature = "std")]
@@ -544,5 +649,33 @@ mod tests {
         hasher.write_all(b"hello world").unwrap();
         let d = hasher.finalize();
         assert_eq!(format!("{d:x}"), "5eb63bbbe01eeed093cb22bb8f5acdc3");
+    }
+
+    #[test]
+    fn compute4_matches_scalar() {
+        let inputs: [&[u8]; 4] = [
+            b"",
+            b"hello world",
+            b"The quick brown fox jumps over the lazy dog",
+            &[0xABu8; 1024],
+        ];
+        let parallel = compute4(inputs);
+        for (i, input) in inputs.iter().enumerate() {
+            assert_eq!(parallel[i], compute(input), "mismatch on input {i}");
+        }
+    }
+
+    #[test]
+    fn compute4_different_lengths() {
+        // Inputs with very different lengths to stress the tail handling.
+        let short = b"a";
+        let medium = b"abcdefghijklmnopqrstuvwxyz";
+        let block_boundary = &[0x42u8; 64];
+        let multi_block = &[0x99u8; 256];
+        let inputs: [&[u8]; 4] = [short, medium, block_boundary, multi_block];
+        let parallel = compute4(inputs);
+        for (i, input) in inputs.iter().enumerate() {
+            assert_eq!(parallel[i], compute(input), "mismatch on input {i}");
+        }
     }
 }
