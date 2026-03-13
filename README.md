@@ -35,15 +35,15 @@ md5 = { version = "0.1", default-features = false }
 Run with `cargo bench`. Comparison against RustCrypto `md-5` on Apple Silicon:
 
 | Buffer size | Ours (MiB/s) | RustCrypto (MiB/s) |
-|-------------|-------------|-------------------|
-| 64 B        | ~416        | ~425              |
-| 256 B       | ~637        | ~653              |
-| 1 KB        | ~750        | ~753              |
-| 4 KB        | ~795        | ~785              |
-| 16 KB       | ~794        | ~785              |
-| 64 KB       | ~800        | ~807              |
-| 1 MB        | ~794        | ~790              |
+| ----------- | ------------ | ------------------ |
+| 64 B        | ~416         | ~425               |
+| 256 B       | ~637         | ~653               |
+| 1 KB        | ~750         | ~753               |
+| 4 KB        | ~795         | ~785               |
+| 16 KB       | ~794         | ~785               |
+| 64 KB       | ~800         | ~807               |
+| 1 MB        | ~794         | ~790               |
 
 ## License
 
-MIT OR Apache-2.0
+MIT
