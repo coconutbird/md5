@@ -3,7 +3,8 @@
 #![allow(
     clippy::inline_always,
     clippy::many_single_char_names,
-    clippy::wildcard_imports
+    clippy::wildcard_imports,
+    clippy::cast_ptr_alignment
 )]
 
 use core::arch::aarch64::*;
@@ -49,51 +50,77 @@ macro_rules! round {
     };
 }
 
-/// Load message word `idx` from 4 blocks into a NEON register (one lane per input).
+/// Transpose a 4×4 matrix of u32 lanes held in four NEON registers.
+///
+/// Input:  `r0 = [a0,a1,a2,a3]`, `r1 = [b0,b1,b2,b3]`, etc.
+/// Output: `[a0,b0,c0,d0]`, `[a1,b1,c1,d1]`, `[a2,b2,c2,d2]`, `[a3,b3,c3,d3]`.
 #[inline(always)]
-unsafe fn load_word(blocks: &[&[u8; 64]; 4], idx: usize) -> uint32x4_t {
+unsafe fn transpose4(
+    r0: uint32x4_t,
+    r1: uint32x4_t,
+    r2: uint32x4_t,
+    r3: uint32x4_t,
+) -> [uint32x4_t; 4] {
     unsafe {
-        let off = idx * 4;
-        let w0 = u32::from_le_bytes([
-            blocks[0][off],
-            blocks[0][off + 1],
-            blocks[0][off + 2],
-            blocks[0][off + 3],
-        ]);
-        let w1 = u32::from_le_bytes([
-            blocks[1][off],
-            blocks[1][off + 1],
-            blocks[1][off + 2],
-            blocks[1][off + 3],
-        ]);
-        let w2 = u32::from_le_bytes([
-            blocks[2][off],
-            blocks[2][off + 1],
-            blocks[2][off + 2],
-            blocks[2][off + 3],
-        ]);
-        let w3 = u32::from_le_bytes([
-            blocks[3][off],
-            blocks[3][off + 1],
-            blocks[3][off + 2],
-            blocks[3][off + 3],
-        ]);
-        vld1q_u32([w0, w1, w2, w3].as_ptr())
+        // Step 1: interleave pairs.
+        let t01_lo = vzip1q_u32(r0, r1); // [a0,b0,a1,b1]
+        let t01_hi = vzip2q_u32(r0, r1); // [a2,b2,a3,b3]
+        let t23_lo = vzip1q_u32(r2, r3); // [c0,d0,c1,d1]
+        let t23_hi = vzip2q_u32(r2, r3); // [c2,d2,c3,d3]
+        // Step 2: combine 64-bit halves to get final columns.
+        let lo0 = vreinterpretq_u64_u32(t01_lo);
+        let lo2 = vreinterpretq_u64_u32(t23_lo);
+        let hi0 = vreinterpretq_u64_u32(t01_hi);
+        let hi2 = vreinterpretq_u64_u32(t23_hi);
+        [
+            vreinterpretq_u32_u64(vzip1q_u64(lo0, lo2)),
+            vreinterpretq_u32_u64(vzip2q_u64(lo0, lo2)),
+            vreinterpretq_u32_u64(vzip1q_u64(hi0, hi2)),
+            vreinterpretq_u32_u64(vzip2q_u64(hi0, hi2)),
+        ]
     }
 }
 
 /// Compress one 64-byte block for 4 independent hash states in parallel.
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn compress4(states: &mut [uint32x4_t; 4], blocks: &[&[u8; 64]; 4]) {
-    // Load 16 message words (each register = word i from all 4 inputs).
+    // Load 16 message words using bulk loads + 4×4 transpose.
+    // Each vld1q_u32 grabs 4 consecutive u32s from one block; we then
+    // transpose so m[i] = word i across all 4 inputs.
     let m: [uint32x4_t; 16] = unsafe {
-        let mut m = [vdupq_n_u32(0); 16];
-        let mut idx = 0;
-        while idx < 16 {
-            m[idx] = load_word(blocks, idx);
-            idx += 1;
-        }
-        m
+        let p0 = blocks[0].as_ptr().cast::<u32>();
+        let p1 = blocks[1].as_ptr().cast::<u32>();
+        let p2 = blocks[2].as_ptr().cast::<u32>();
+        let p3 = blocks[3].as_ptr().cast::<u32>();
+
+        // Words 0-3
+        let t0 = transpose4(vld1q_u32(p0), vld1q_u32(p1), vld1q_u32(p2), vld1q_u32(p3));
+        // Words 4-7
+        let t1 = transpose4(
+            vld1q_u32(p0.add(4)),
+            vld1q_u32(p1.add(4)),
+            vld1q_u32(p2.add(4)),
+            vld1q_u32(p3.add(4)),
+        );
+        // Words 8-11
+        let t2 = transpose4(
+            vld1q_u32(p0.add(8)),
+            vld1q_u32(p1.add(8)),
+            vld1q_u32(p2.add(8)),
+            vld1q_u32(p3.add(8)),
+        );
+        // Words 12-15
+        let t3 = transpose4(
+            vld1q_u32(p0.add(12)),
+            vld1q_u32(p1.add(12)),
+            vld1q_u32(p2.add(12)),
+            vld1q_u32(p3.add(12)),
+        );
+
+        [
+            t0[0], t0[1], t0[2], t0[3], t1[0], t1[1], t1[2], t1[3], t2[0], t2[1], t2[2], t2[3],
+            t3[0], t3[1], t3[2], t3[3],
+        ]
     };
 
     let (mut a, mut b, mut c, mut d) = (states[0], states[1], states[2], states[3]);
